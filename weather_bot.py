@@ -1,71 +1,134 @@
+# === 1. ИМПОРТЫ И НАСТРОЙКА ОКРУЖЕНИЯ ===
+
 import os
 
-from dotenv import load_dotenv
-from flask import Flask, abort, request
-import requests
-import telebot
+
+# Проверяем: запущено ли приложение на Render?
+# Render автоматически устанавливает переменную окружения RENDER='true'
+# Если её нет — значит, мы локально → можно использовать .env
+if os.getenv("RENDER") is None:
+    # Загружаем переменные из .env (ТОЛЬКО ЛОКАЛЬНО!)
+    from dotenv import load_dotenv
+
+    load_dotenv()  # читает файл .env и добавляет его содержимое в os.environ
+
+# === 2. ЧТЕНИЕ ОБЯЗАТЕЛЬНЫХ ПЕРЕМЕННЫХ ===
+
+# Эти переменные ДОЛЖНЫ быть заданы:
+# - локально — в файле .env
+# - на Render — в Environment Variables (в настройках сервиса)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # Токен бота от @BotFather
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")  # Ключ с openweathermap.org
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Публичный URL вашего сервиса на Render
+
+# Защита: если хоть одна переменная не задана — приложение упадёт с понятной ошибкой
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("❌ TELEGRAM_TOKEN не задан!")
+if not OPENWEATHER_API_KEY:
+    raise RuntimeError("❌ OPENWEATHER_API_KEY не задан!")
+if not WEBHOOK_URL:
+    raise RuntimeError(
+        "❌ WEBHOOK_URL не задан! Пример: https://ваш-сервис.onrender.com"
+    )
+
+# === 3. ИМПОРТ ОСТАЛЬНЫХ БИБЛИОТЕК (после проверки переменных) ===
+
+from flask import Flask, abort, request  # Flask — веб-фреймворк
+import requests  # Для HTTP-запросов к OpenWeather и Telegram API
+import telebot  # Библиотека для работы с Telegram Bot API
 
 
-# === Настройки ===
-load_dotenv()
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Например: https://your-bot.onrender.com
-
+# Создаём объект бота
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# Flask-приложение (Render требует WSGI-приложение)
+# Создаём Flask-приложение (Render требует WSGI-приложение — Flask его предоставляет)
 app = Flask(__name__)
 
 
-# Установка webhook при запуске
+# === 4. ENDPOINT ДЛЯ УСТАНОВКИ WEBHOOK (вызывается ВРУЧНУЮ через браузер) ===
+
+
 @app.route("/set_webhook", methods=["GET"])
 def set_webhook():
+    """
+    Эта функция вызывается, когда вы открываете в браузере:
+        https://ваш-сервис.onrender.com/set_webhook
+
+    Она отправляет запрос Telegram API, чтобы сказать:
+        "Пожалуйста, присылай все обновления (сообщения) на мой URL: {WEBHOOK_URL}/webhook"
+    """
+    # ⚠️ ВАЖНО: НЕТ ПРОБЕЛОВ между 'bot' и токеном!
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+
+    # Отправляем POST-запрос с JSON-телом: {"url": "https://.../webhook"}
     response = requests.post(url, json={"url": f"{WEBHOOK_URL}/webhook"})
-    return f"Webhook set: {response.json()}"
+
+    # Возвращаем результат в браузер (для отладки)
+    return f"Webhook set result: {response.json()}"
 
 
-# Endpoint для Telegram
+# === 5. ENDPOINT ДЛЯ ПРИЁМА СООБЩЕНИЙ ОТ TELEGRAM ===
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    """
+    Этот endpoint — "почтовый ящик" для Telegram.
+    Когда пользователь пишет боту, Telegram отправляет POST-запрос СЮДА.
+    """
+    # Проверяем, что запрос пришёл в формате JSON
     if request.headers.get("content-type") == "application/json":
+        # Читаем тело запроса как строку
         json_string = request.get_data().decode("utf-8")
+        # Преобразуем JSON в объект Update (структура Telegram)
         update = telebot.types.Update.de_json(json_string)
+        # Передаём обновление библиотеке pyTelegramBotAPI для обработки
         bot.process_new_updates([update])
-        return ""
+        # Возвращаем пустой ответ со статусом 200 (успех)
+        return "", 200
     else:
+        # Если запрос не JSON — отклоняем с ошибкой 403
         abort(403)
 
 
-# Обработчики бота
+# === 6. ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ===
+
+
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
+    """Отвечает на /start и /help"""
     bot.reply_to(message, "Привет! Напиши название города — и я скажу погоду 🌤️")
 
 
 @bot.message_handler(func=lambda message: True)
 def get_weather(message):
+    """Обрабатывает ЛЮБОЕ текстовое сообщение (кроме команд) как название города"""
     city = message.text.strip()
     if not city:
         bot.reply_to(message, "Пожалуйста, введи название города.")
         return
 
-    url = "http://api.openweathermap.org/data/2.5/weather"
-    params = {"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric", "lang": "ru"}
-
     try:
-        response = requests.get(url, params=params)
+        # Запрос к OpenWeatherMap
+        url = "http://api.openweathermap.org/data/2.5/weather"
+        params = {
+            "q": city,  # Название города
+            "appid": OPENWEATHER_API_KEY,  # Ваш ключ
+            "units": "metric",  # Температура в °C
+            "lang": "ru",  # Описание погоды на русском
+        }
+        response = requests.get(url, params=params, timeout=10)
         data = response.json()
 
         if response.status_code == 200:
+            # Извлекаем данные из ответа
             temp = data["main"]["temp"]
             desc = data["weather"][0]["description"].capitalize()
             feels_like = data["main"]["feels_like"]
             humidity = data["main"]["humidity"]
             wind = data["wind"]["speed"]
 
+            # Формируем красивый ответ
             answer = (
                 f"🌤 Погода в {city}:\n"
                 f"Температура: {temp}°C (ощущается как {feels_like}°C)\n"
@@ -80,7 +143,14 @@ def get_weather(message):
         bot.reply_to(message, "Ошибка при получении погоды. Попробуй позже.")
 
 
-# Точка входа для Render
+# === 7. ТОЧКА ВХОДА ДЛЯ ЛОКАЛЬНОГО ЗАПУСКА ===
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 443))
-    app.run(host="0.0.0.0", port=port)
+    """
+    Эта часть выполняется ТОЛЬКО при локальном запуске: python app.py
+    На Render она НЕ вызывается, потому что Render запускает приложение через WSGI,
+    но Flask всё равно должен быть настроен на прослушивание нужного порта.
+    """
+    # Render передаёт порт через переменную окружения PORT
+    port = int(os.environ.get("PORT", 10000))  # 10000 — fallback для локального запуска
+    app.run(host="0.0.0.0", port=port)  # host="0.0.0.0" — слушать все интерфейсы
